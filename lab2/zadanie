@@ -1,0 +1,5 @@
+plik z 3 kulumny xyz z koordynatami na siatce 5x5 -20,-10,0,10,20 w xy, z dowolne od 0-255
+użyj gltranslate i glrotate aby widać było całość
+narysuj powierzchnię z tej macierzy
+nie rób float
+kolor zależny od z
