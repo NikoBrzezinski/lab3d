@@ -227,7 +227,7 @@ def main():
     if not glfw.init(): return
     win = glfw.create_window(800, 600, "Final Terrain Renderer", None, None)
     glfw.make_context_current(win)
-    start_music('Meow.ogg')
+    start_music('meow.ogx')
 
     r = TerrainRenderer('coordinates.csv', grid_size=19)
     v, i = r.load_data()
