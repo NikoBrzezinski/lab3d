@@ -223,10 +223,11 @@ def start_music(file):
     except: print("Music file error")
 
 def main():
+    pygame.init()
     if not glfw.init(): return
     win = glfw.create_window(800, 600, "Final Terrain Renderer", None, None)
     glfw.make_context_current(win)
-    start_music('music.mp3')
+    start_music('Meow.ogg')
 
     r = TerrainRenderer('coordinates.csv', grid_size=19)
     v, i = r.load_data()
