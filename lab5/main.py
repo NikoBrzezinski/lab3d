@@ -1,0 +1,281 @@
+import glfw
+from OpenGL.GL import *
+import numpy as np
+import csv
+import ctypes
+from pyrr import Matrix44, Vector3
+
+class TerrainRenderer:
+    def __init__(self, filename, grid_size=19):
+        self.filename = filename
+        self.grid_size = grid_size
+        self.shader_program = None
+        self.raw_coords = []
+        self.t_vbo = None
+        self.terrain_texture = None
+
+        # Camera State
+        self.cam_pos = np.array([0.0, 60.0, 160.0], dtype=np.float32)
+        self.cam_yaw = 0.0
+
+        # Sphere State
+        self.sphere_pos = np.array([0.0, 10.0, 0.0], dtype=np.float32)
+        self.sphere_yaw = 0.0
+
+        # Plane State
+        self.is_rotating = False
+        self.plane_rotation = 0.0
+        self.is_log_scale = False
+        
+        # Water Shader State
+        self.water_enabled = False
+
+    def create_1d_texture(self):
+        # Blue -> Green -> Brown -> White (Snow)
+        colors = np.array([
+            [20, 20, 200],   # Low (Water)
+            [30, 180, 30],   # Mid (Grass)
+            [100, 60, 30],   # High (Mountain)
+            [255, 255, 255]  # Peak (Snow)
+        ], dtype=np.uint8)
+
+        self.terrain_texture = glGenTextures(1)
+        glBindTexture(GL_TEXTURE_1D, self.terrain_texture)
+        glTexParameteri(GL_TEXTURE_1D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+        glTexParameteri(GL_TEXTURE_1D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+        glTexParameteri(GL_TEXTURE_1D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+        glTexImage1D(GL_TEXTURE_1D, 0, GL_RGB, 4, 0, GL_RGB, GL_UNSIGNED_BYTE, colors)
+
+    def load_data(self):
+        try:
+            with open(self.filename, 'r') as csvfile:
+                csvreader = csv.reader(csvfile)
+                next(csvreader)
+                for row in csvreader:
+                    if not row: continue
+                    self.raw_coords.append([float(val) for val in row])
+        except FileNotFoundError:
+            print("CSV not found!")
+            return None, None
+
+        indices = []
+        for i in range(self.grid_size - 1):
+            for j in range(self.grid_size - 1):
+                tl, tr = i * self.grid_size + j, i * self.grid_size + j + 1
+                bl, br = (i + 1) * self.grid_size + j, (i + 1) * self.grid_size + j + 1
+                indices.extend([tl, tr, bl, tr, br, bl])
+        return self.process_vertices(), np.array(indices, dtype=np.uint32)
+
+    def process_vertices(self):
+        processed = []
+        y_vals = [r[1] for r in self.raw_coords]
+        min_y, max_y = min(y_vals), max(y_vals)
+        y_range = (max_y - min_y) if max_y != min_y else 1.0
+
+        for x, y, z in self.raw_coords:
+            display_y = np.log(max(y, 1.0)) * 12 if self.is_log_scale else y
+            u = (y - min_y) / y_range
+            processed.extend([x, display_y, z, u])
+        return np.array(processed, dtype=np.float32)
+
+    def create_sphere(self, radius=4.0, rings=20, sectors=20):
+        verts, indices = [], []
+        for r in range(rings + 1):
+            phi = np.pi * r / rings
+            for s in range(sectors + 1):
+                theta = 2 * np.pi * s / sectors
+                x = radius * np.sin(phi) * np.cos(theta)
+                y = radius * np.cos(phi)
+                z = radius * np.sin(phi) * np.sin(theta)
+                verts.extend([x, y, z, 0.9]) # u=0.9 for sphere color
+        for r in range(rings):
+            for s in range(sectors):
+                cur, nxt = r * (sectors + 1) + s, (r + 1) * (sectors + 1) + s
+                indices.extend([cur, nxt, cur + 1, nxt, nxt + 1, cur + 1])
+        return np.array(verts, dtype=np.float32), np.array(indices, dtype=np.uint32)
+
+    def init_opengl(self, t_verts, t_indices):
+        v_src = """
+        #version 330 core
+        layout (location = 0) in vec3 aPos;
+        layout (location = 1) in float aTex;
+        out float vTex;
+        out vec3 fragPos;
+        uniform mat4 model, view, proj;
+        void main() {
+            vec4 worldPos = model * vec4(aPos, 1.0);
+            gl_Position = proj * view * worldPos;
+            vTex = aTex;
+            fragPos = worldPos.xyz; // Pass transformed world coordinates for consistent wave math
+        }"""
+        
+        f_src = """
+        #version 330 core
+        out vec4 FragColor;
+        in float vTex;
+        in vec3 fragPos;
+        
+        uniform sampler1D tex;
+        uniform bool waterEnabled;
+        uniform float time;
+        
+        void main() { 
+            vec4 baseColor = texture(tex, vTex);
+            
+            // If water is active and the elevation texture coordinate points to the lowest tier (Water)
+            if (waterEnabled && vTex < 0.35) {
+                // 1. Establish a more vivid, vibrant blue base color for the water body
+                vec3 waterBase = vec3(0.05, 0.25, 0.65);
+                
+                // 2. Layer multiple sine waves traveling in opposite directions for an organic feel
+                float wave1 = sin(fragPos.x * 0.15 + time * 2.5) * cos(fragPos.z * 0.15 + time * 2.0);
+                float wave2 = cos(fragPos.x * 0.3 - time * 1.8) * sin(fragPos.z * 0.2 + time * 1.5);
+                float combinedWave = (wave1 + wave2) * 0.5;
+                
+                // 3. Create high-frequency specular shimmer bursts
+                float shimmer = pow(max(combinedWave, 0.0), 4.0) * 1.5;
+                
+                // 4. Create sharp, bright crest lines (foam simulation) 
+                float foam = smoothstep(0.4, 0.6, abs(combinedWave)) * 0.35;
+                
+                // Merge elements together
+                vec3 finalWaterColor = waterBase + vec3(shimmer) + vec3(foam * 0.4, foam * 0.8, foam);
+                
+                // Gently blend the custom water style into the edge of the shore transitions
+                float shoreBlend = smoothstep(0.0, 0.25, vTex);
+                FragColor = vec4(mix(finalWaterColor, baseColor.rgb, shoreBlend * 0.3), 1.0);
+            } else {
+                FragColor = baseColor;
+            }
+        }"""
+
+        self.shader_program = self._compile(v_src, f_src)
+        self.create_1d_texture()
+
+        def gen_vao(v, i, stride):
+            vao = glGenVertexArrays(1)
+            glBindVertexArray(vao)
+            vbo, ebo = glGenBuffers(2)
+            glBindBuffer(GL_ARRAY_BUFFER, vbo)
+            glBufferData(GL_ARRAY_BUFFER, v.nbytes, v, GL_DYNAMIC_DRAW)
+            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ebo)
+            glBufferData(GL_ELEMENT_ARRAY_BUFFER, i.nbytes, i, GL_STATIC_DRAW)
+            glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, stride, ctypes.c_void_p(0))
+            glEnableVertexAttribArray(0)
+            glVertexAttribPointer(1, 1, GL_FLOAT, GL_FALSE, stride, ctypes.c_void_p(12))
+            glEnableVertexAttribArray(1)
+            return vao, len(i), vbo
+
+        self.t_vao, self.t_cnt, self.t_vbo = gen_vao(t_verts, t_indices, 16)
+        sv, si = self.create_sphere()
+        self.s_vao, self.s_cnt, _ = gen_vao(sv, si, 16)
+
+    def _compile(self, vs, fs):
+        p = glCreateProgram()
+        for s, t in [(vs, GL_VERTEX_SHADER), (fs, GL_FRAGMENT_SHADER)]:
+            sh = glCreateShader(t); glShaderSource(sh, s); glCompileShader(sh)
+            glAttachShader(p, sh)
+        glLinkProgram(p)
+        return p
+
+    def update(self, window, dt):
+        speed = 60.0 * dt
+        rot_s = 2.0 * dt
+
+        # Camera WASDQE
+        if glfw.get_key(window, glfw.KEY_W): self.cam_pos[2] -= speed
+        if glfw.get_key(window, glfw.KEY_S): self.cam_pos[2] += speed
+        if glfw.get_key(window, glfw.KEY_A): self.cam_pos[0] -= speed
+        if glfw.get_key(window, glfw.KEY_D): self.cam_pos[0] += speed
+        if glfw.get_key(window, glfw.KEY_Q): self.cam_pos[1] += speed
+        if glfw.get_key(window, glfw.KEY_E): self.cam_pos[1] -= speed
+
+        # Sphere Arrows
+        if glfw.get_key(window, glfw.KEY_LEFT):  self.sphere_yaw += rot_s
+        if glfw.get_key(window, glfw.KEY_RIGHT): self.sphere_yaw -= rot_s
+        fx, fz = np.sin(self.sphere_yaw), np.cos(self.sphere_yaw)
+        if glfw.get_key(window, glfw.KEY_UP):
+            self.sphere_pos[0] += fx * speed
+            self.sphere_pos[2] += fz * speed
+        if glfw.get_key(window, glfw.KEY_DOWN):
+            self.sphere_pos[0] -= fx * speed
+            self.sphere_pos[2] -= fz * speed
+
+        if self.is_rotating: self.plane_rotation += rot_s
+
+    def mouse_callback(self,window, button, action,modes):
+        if action == glfw.PRESS:
+            if button == glfw.MOUSE_BUTTON_LEFT:
+                self.is_rotating = not self.is_rotating
+            elif button == glfw.MOUSE_BUTTON_RIGHT:
+                self.is_log_scale = not self.is_log_scale
+                v = self.process_vertices()
+                glBindBuffer(GL_ARRAY_BUFFER, self.t_vbo)
+                glBufferSubData(GL_ARRAY_BUFFER, 0, v.nbytes, v)
+            elif button == glfw.MOUSE_BUTTON_MIDDLE:
+                self.water_enabled = not self.water_enabled
+
+    def render(self, window):
+        glEnable(GL_DEPTH_TEST)
+        m_loc = glGetUniformLocation(self.shader_program, "model")
+        v_loc = glGetUniformLocation(self.shader_program, "view")
+        p_loc = glGetUniformLocation(self.shader_program, "proj")
+        
+        # Water Uniform Locations
+        water_loc = glGetUniformLocation(self.shader_program, "waterEnabled")
+        time_loc = glGetUniformLocation(self.shader_program, "time")
+        
+        glfw.set_mouse_button_callback(window, self.mouse_callback)
+
+        last_t = glfw.get_time()
+        while not glfw.window_should_close(window):
+            current_time = glfw.get_time()
+            dt = current_time - last_t
+            last_t = current_time
+            self.update(window, dt)
+
+            glClearColor(0.1, 0.1, 0.1, 1.0)
+            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+            glUseProgram(self.shader_program)
+
+            #water shader
+            glUniform1i(water_loc, self.water_enabled)
+            glUniform1f(time_loc, current_time)
+
+            proj = Matrix44.perspective_projection(45.0, 800/600, 0.1, 2000.0)
+            view = Matrix44.from_translation(-self.cam_pos)
+            glUniformMatrix4fv(p_loc, 1, GL_FALSE, proj)
+            glUniformMatrix4fv(v_loc, 1, GL_FALSE, view)
+
+            glActiveTexture(GL_TEXTURE0)
+            glBindTexture(GL_TEXTURE_1D, self.terrain_texture)
+
+            # Terrain
+            tm = Matrix44.from_y_rotation(self.plane_rotation)
+            glUniformMatrix4fv(m_loc, 1, GL_FALSE, tm)
+            glBindVertexArray(self.t_vao)
+            glDrawElements(GL_TRIANGLES, self.t_cnt, GL_UNSIGNED_INT, None)
+
+            # Sphere
+            sm = Matrix44.from_translation(self.sphere_pos) * Matrix44.from_y_rotation(self.sphere_yaw)
+            glUniformMatrix4fv(m_loc, 1, GL_FALSE, sm)
+            glBindVertexArray(self.s_vao)
+            glDrawElements(GL_TRIANGLES, self.s_cnt, GL_UNSIGNED_INT, None)
+
+            glfw.swap_buffers(window)
+            glfw.poll_events()
+
+def main():
+    if not glfw.init(): return
+    win = glfw.create_window(800, 600, "Final Terrain Renderer", None, None)
+    glfw.make_context_current(win)
+
+    r = TerrainRenderer('coordinates.csv', grid_size=19)
+    v, i = r.load_data()
+    if v is not None:
+        r.init_opengl(v, i)
+        r.render(win)
+    glfw.terminate()
+
+if __name__ == "__main__":
+    main()
