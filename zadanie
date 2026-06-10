@@ -12,3 +12,6 @@ generować w skali liniowej i log. przycisk do zmieniania
 animacja, klikając przycisk odpalasz obracanie się planszy np
 muzyka w tle
 tekstura 1d
+
+4. wygenerować widmo fouriera i odwrotną i je pokazać z obrazka 
+albo labirynt albo efekt graficzny(np water shader)

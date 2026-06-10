@@ -3,7 +3,6 @@ from OpenGL.GL import *
 import numpy as np
 import csv
 import ctypes
-import pygame
 from pyrr import Matrix44, Vector3
 
 class TerrainRenderer:
@@ -28,13 +27,64 @@ class TerrainRenderer:
         self.plane_rotation = 0.0
         self.is_log_scale = False
 
+        # Water Shader State
+        self.water_enabled = False
+        
+        # --- NEW: Cloud State ---
+        self.clouds = self._generate_clouds(12)
+
+    def _generate_clouds(self, count):
+        """Generates clumpy clouds strictly flattened parallel to the ground (XZ plane)."""
+        clouds = []
+        for _ in range(count):
+            # Base position in the sky
+            x = np.random.uniform(-150.0, 150.0)
+            y = np.random.uniform(40.0, 80.0) 
+            z = np.random.uniform(-100.0, 100.0)
+
+            speed = np.random.uniform(2.0, 12.0)
+            
+            # Massive increase in spheres for a dense, clumpy look
+            num_puffs = np.random.randint(15, 35) 
+            puffs = []
+            
+            # Maximum horizontal spread from the cloud center
+            max_distance = 12.0 
+            
+            for _ in range(num_puffs):
+                # 1. Distribute offsets strictly in a flat 2D disc along the XZ (ground) plane
+                r_xz = max_distance * np.sqrt(np.random.uniform(0.0, 1.0))
+                angle = np.random.uniform(0.0, 2.0 * np.pi)
+                
+                dx = r_xz * np.cos(angle)
+                dz = r_xz * np.sin(angle)
+                
+                # Keep vertical deviation tight to maintain the flat shape
+                dy = np.random.uniform(-1.0, 1.5) 
+                
+                # 2. Scale the individual puffs to be flat-bottomed/pillowy
+                sx = np.random.uniform(3.0, 6.0)
+                sy = np.random.uniform(1.0, 2.5) # Squashed vertically (Y axis)
+                sz = np.random.uniform(3.0, 6.0)
+                
+                puffs.append({
+                    "offset": np.array([dx, dy, dz], dtype=np.float32),
+                    "scale": np.array([sx, sy, sz], dtype=np.float32)
+                })
+            
+            clouds.append({
+                "pos": np.array([x, y, z], dtype=np.float32),
+                "speed": speed,
+                "puffs": puffs
+            })
+        return clouds
+
     def create_1d_texture(self):
-        # Blue -> Green -> Brown -> White (Snow)
         colors = np.array([
             [20, 20, 200],   # Low (Water)
             [30, 180, 30],   # Mid (Grass)
             [100, 60, 30],   # High (Mountain)
-            [255, 255, 255]  # Peak (Snow)
+            [255, 255, 255]  # Peak (Snow/Clouds)
         ], dtype=np.uint8)
 
         self.terrain_texture = glGenTextures(1)
@@ -85,7 +135,7 @@ class TerrainRenderer:
                 x = radius * np.sin(phi) * np.cos(theta)
                 y = radius * np.cos(phi)
                 z = radius * np.sin(phi) * np.sin(theta)
-                verts.extend([x, y, z, 0.9]) # u=0.9 for sphere color
+                verts.extend([x, y, z, 0.9]) 
         for r in range(rings):
             for s in range(sectors):
                 cur, nxt = r * (sectors + 1) + s, (r + 1) * (sectors + 1) + s
@@ -98,17 +148,44 @@ class TerrainRenderer:
         layout (location = 0) in vec3 aPos;
         layout (location = 1) in float aTex;
         out float vTex;
+        out vec3 fragPos;
         uniform mat4 model, view, proj;
         void main() {
-            gl_Position = proj * view * model * vec4(aPos, 1.0);
+            vec4 worldPos = model * vec4(aPos, 1.0);
+            gl_Position = proj * view * worldPos;
             vTex = aTex;
+            fragPos = worldPos.xyz;
         }"""
+
         f_src = """
         #version 330 core
         out vec4 FragColor;
         in float vTex;
+        in vec3 fragPos;
+
         uniform sampler1D tex;
-        void main() { FragColor = texture(tex, vTex); }"""
+        uniform bool waterEnabled;
+        uniform float time;
+
+        void main() {
+            vec4 baseColor = texture(tex, vTex);
+
+            if (waterEnabled && vTex < 0.35) {
+                vec3 waterBase = vec3(0.05, 0.25, 0.65);
+                float wave1 = sin(fragPos.x * 0.15 + time * 2.5) * cos(fragPos.z * 0.15 + time * 2.0);
+                float wave2 = cos(fragPos.x * 0.3 - time * 1.8) * sin(fragPos.z * 0.2 + time * 1.5);
+                float combinedWave = (wave1 + wave2) * 0.5;
+
+                float shimmer = pow(max(combinedWave, 0.0), 4.0) * 1.5;
+                float foam = smoothstep(0.4, 0.6, abs(combinedWave)) * 0.35;
+
+                vec3 finalWaterColor = waterBase + vec3(shimmer) + vec3(foam * 0.4, foam * 0.8, foam);
+                float shoreBlend = smoothstep(0.0, 0.25, vTex);
+                FragColor = vec4(mix(finalWaterColor, baseColor.rgb, shoreBlend * 0.3), 1.0);
+            } else {
+                FragColor = baseColor;
+            }
+        }"""
 
         self.shader_program = self._compile(v_src, f_src)
         self.create_1d_texture()
@@ -143,7 +220,6 @@ class TerrainRenderer:
         speed = 60.0 * dt
         rot_s = 2.0 * dt
 
-        # Camera WASDQE
         if glfw.get_key(window, glfw.KEY_W): self.cam_pos[2] -= speed
         if glfw.get_key(window, glfw.KEY_S): self.cam_pos[2] += speed
         if glfw.get_key(window, glfw.KEY_A): self.cam_pos[0] -= speed
@@ -151,8 +227,6 @@ class TerrainRenderer:
         if glfw.get_key(window, glfw.KEY_Q): self.cam_pos[1] += speed
         if glfw.get_key(window, glfw.KEY_E): self.cam_pos[1] -= speed
 
-
-        # Sphere Arrows
         if glfw.get_key(window, glfw.KEY_LEFT):  self.sphere_yaw += rot_s
         if glfw.get_key(window, glfw.KEY_RIGHT): self.sphere_yaw -= rot_s
         fx, fz = np.sin(self.sphere_yaw), np.cos(self.sphere_yaw)
@@ -164,8 +238,14 @@ class TerrainRenderer:
             self.sphere_pos[2] -= fz * speed
 
         if self.is_rotating: self.plane_rotation += rot_s
+        
+        for cloud in self.clouds:
+            cloud["pos"][0] += cloud["speed"] * dt
+            if cloud["pos"][0] > 150.0:
+                cloud["pos"][0] = -150.0
+                cloud["pos"][2] = np.random.uniform(-100.0, 100.0)
 
-    def mouse_callback(self, window, button, action, mods):
+    def mouse_callback(self, window, button, action, modes):
         if action == glfw.PRESS:
             if button == glfw.MOUSE_BUTTON_LEFT:
                 self.is_rotating = not self.is_rotating
@@ -174,23 +254,33 @@ class TerrainRenderer:
                 v = self.process_vertices()
                 glBindBuffer(GL_ARRAY_BUFFER, self.t_vbo)
                 glBufferSubData(GL_ARRAY_BUFFER, 0, v.nbytes, v)
+            elif button == glfw.MOUSE_BUTTON_MIDDLE:
+                self.water_enabled = not self.water_enabled
 
     def render(self, window):
         glEnable(GL_DEPTH_TEST)
         m_loc = glGetUniformLocation(self.shader_program, "model")
         v_loc = glGetUniformLocation(self.shader_program, "view")
         p_loc = glGetUniformLocation(self.shader_program, "proj")
+
+        water_loc = glGetUniformLocation(self.shader_program, "waterEnabled")
+        time_loc = glGetUniformLocation(self.shader_program, "time")
+
         glfw.set_mouse_button_callback(window, self.mouse_callback)
 
         last_t = glfw.get_time()
         while not glfw.window_should_close(window):
-            dt = glfw.get_time() - last_t
-            last_t = glfw.get_time()
+            current_time = glfw.get_time()
+            dt = current_time - last_t
+            last_t = current_time
             self.update(window, dt)
 
             glClearColor(0.1, 0.1, 0.1, 1.0)
             glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
             glUseProgram(self.shader_program)
+
+            glUniform1i(water_loc, self.water_enabled)
+            glUniform1f(time_loc, current_time)
 
             proj = Matrix44.perspective_projection(45.0, 800/600, 0.1, 2000.0)
             view = Matrix44.from_translation(-self.cam_pos)
@@ -200,34 +290,31 @@ class TerrainRenderer:
             glActiveTexture(GL_TEXTURE0)
             glBindTexture(GL_TEXTURE_1D, self.terrain_texture)
 
-            # Terrain
             tm = Matrix44.from_y_rotation(self.plane_rotation)
             glUniformMatrix4fv(m_loc, 1, GL_FALSE, tm)
             glBindVertexArray(self.t_vao)
             glDrawElements(GL_TRIANGLES, self.t_cnt, GL_UNSIGNED_INT, None)
 
-            # Sphere
             sm = Matrix44.from_translation(self.sphere_pos) * Matrix44.from_y_rotation(self.sphere_yaw)
             glUniformMatrix4fv(m_loc, 1, GL_FALSE, sm)
             glBindVertexArray(self.s_vao)
             glDrawElements(GL_TRIANGLES, self.s_cnt, GL_UNSIGNED_INT, None)
 
+            for cloud in self.clouds:
+                for puff in cloud["puffs"]:
+                    puff_world_pos = cloud["pos"] + puff["offset"]
+                    
+                    cm = Matrix44.from_scale(puff["scale"]) * Matrix44.from_translation(puff_world_pos)
+                    glUniformMatrix4fv(m_loc, 1, GL_FALSE, cm)
+                    glDrawElements(GL_TRIANGLES, self.s_cnt, GL_UNSIGNED_INT, None)
+
             glfw.swap_buffers(window)
             glfw.poll_events()
 
-def start_music(file):
-    try:
-        pygame.mixer.init()
-        pygame.mixer.music.load(file)
-        pygame.mixer.music.play(-1)
-    except: print("Music file error")
-
 def main():
-    pygame.init()
     if not glfw.init(): return
     win = glfw.create_window(800, 600, "Final Terrain Renderer", None, None)
     glfw.make_context_current(win)
-    start_music('meow.ogx')
 
     r = TerrainRenderer('coordinates.csv', grid_size=19)
     v, i = r.load_data()
